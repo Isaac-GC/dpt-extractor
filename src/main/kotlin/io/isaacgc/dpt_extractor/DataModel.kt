@@ -24,6 +24,9 @@ data class PatchResult(
 data class InstructionRecord(
     // u32 - methodIndex
     val methodIndex: Int,
+    // u32 - offset idx of the repsective dex file
+    // used only in v1 of dpt-shell, should be "0" for v2
+    val offsetDexIdx: Int,
     // u32 insnsDataSize
     val insnsSize: Int,
     // u8 insnsData[insnsSize] --> should be all the instructions
@@ -34,6 +37,7 @@ data class InstructionRecord(
         if (other !is InstructionRecord) return false
 
         return methodIndex == other.methodIndex
+                && offsetDexIdx == other.offsetDexIdx
                 && insnsSize == other.insnsSize
                 && insnsData.contentEquals(other.insnsData)
     }
@@ -46,6 +50,6 @@ data class InstructionRecord(
     }
 
     override fun toString(): String {
-        return "io.isaacgc.dpt_extractor.InstructionRecord(methodIndex=$methodIndex, insnsSize=$insnsSize)"
+        return "io.isaacgc.dpt_extractor.InstructionRecord(methodIndex=$methodIndex, insnsSize=$insnsSize,offsetDexIdx=$offsetDexIdx)"
     }
 }

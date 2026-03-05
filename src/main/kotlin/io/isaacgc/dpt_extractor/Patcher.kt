@@ -104,14 +104,22 @@ class Patcher(originalBytes: ByteArray) {
                 continue
             }
 
-            val codeOffset = methodToCodeOffset[methodIdx]
-            if (codeOffset == null) {
-                System.err.println("[X] Warning -- $dexFileName: method $methodIdx not found in DEX content")
-                numSkipped++
-                continue
+
+            val insnsOffset = if (record.offsetDexIdx != 0) {
+                // v1
+                record.offsetDexIdx
+            } else {
+                // v2
+                val codeOffset = methodToCodeOffset[methodIdx]
+                if (codeOffset == null) {
+                    System.err.println("[X] Warning -- $dexFileName: method $methodIdx not found in DEX content")
+                    numSkipped++
+                    continue
+                }
+                codeOffset + 16
             }
 
-            val insnsOffset = codeOffset + 16
+
             val insnsEnd = insnsOffset + record.insnsSize
             if (insnsEnd > buffer.size) {
                 System.err.println("[X] Warning -- $dexFileName: method $methodIdx insns is out of bounds")

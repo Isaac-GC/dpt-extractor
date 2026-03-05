@@ -33,12 +33,21 @@ object Parser {
 
             repeat(methodCount) {
                 val methodIdx = ByteBuffer.wrap(data, pos, 4).order(ByteOrder.LITTLE_ENDIAN).int
-                val insnsBytes = ByteBuffer.wrap(data, pos + 4, 4).order(ByteOrder.LITTLE_ENDIAN).int
-//                val insnsBytes = insnsCodeUnits * 2
 
-                val insns = data.copyOfRange(pos + 8, pos + 8 + insnsBytes)
-                records[methodIdx] = InstructionRecord(methodIdx, insnsBytes, insns)
-                pos += (8 + insnsBytes)
+                var verOffset = 0
+                var offsetDexIdx = 0
+                if (version == 1) {
+                    verOffset += 4 // verOffset should be: v1 = 4, v2 = 0
+                    offsetDexIdx = ByteBuffer.wrap(data, 4, 4).order(ByteOrder.LITTLE_ENDIAN).int
+                }
+
+                verOffset += 4 // v1 = 8, v2 = 4
+                val insnsBytes = ByteBuffer.wrap(data, pos + verOffset, 4).order(ByteOrder.LITTLE_ENDIAN).int
+
+                verOffset += 4 // v1 = 12, v2 = 8
+                val insns = data.copyOfRange(pos + verOffset, pos + verOffset + insnsBytes)
+                records[methodIdx] = InstructionRecord(methodIdx, offsetDexIdx, insnsBytes, insns)
+                pos += (verOffset + insnsBytes)
             }
 
             blocks += DexCodeBlock(dexIdx, records)
