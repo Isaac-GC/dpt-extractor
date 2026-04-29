@@ -65,12 +65,20 @@ class ApkExtractor {
             }
 
             ZipFile(tmpZip).use { inner ->
-                val dexEntries = inner.entries().asSequence()
+                val allDexEntries = inner.entries().asSequence()
                     .filter { it.name.endsWith(".dex") }
                     .sortedBy { dexIndex(it.name) }
                     .toList()
 
-                println("[+] Inner zip contains ${dexEntries.size} dex file(s)\n")
+                val (dexEntries, junkEntries) = allDexEntries.partition { dexIndex(it.name) >= 0 }
+                val sortedDexEntries = dexEntries.sortedBy { dexIndex(it.name) }
+
+                println("[+] Inner zip contains ${allDexEntries.size} dex file(s)\n" +
+                    if (junkEntries.isNotEmpty()) " (skipping ${junkEntries.size} non-classes dex: ${junkEntries.joinToString { it.name }})"
+                    else ""
+                )
+                println()
+
                 for (entry in dexEntries) {
                     val idx = dexIndex(entry.name)
                     val dexBytes = inner.getInputStream(entry).readBytes()
@@ -98,6 +106,21 @@ class ApkExtractor {
                     println("\tSaved: ${outFile.path} (${patcher.getBytes().size.humanSize()}")
 
                     results += result
+                }
+            }
+
+            val keepDexEntries = apk.entries().asSequence()
+                        .filter { it.name.matches(Regex("""classes\d+\.dex""")) }
+                        .sortedBy { dexIndex(it.name) }
+                        .toList()
+
+            if (keepDexEntries.isNotEmpty()) {
+                println("\n[+] Found ${keepDexEntries.size} dex entries(s) (from the '--keep-classes' flag")
+                for (entry in keepDexEntries) {
+                    val data = apk.getInputStream(entry).readBytes()
+                    val outName = "keep_${entry.name}"
+                    File(outputDir, outName).writeBytes(data)
+                    println("\tCopied: ${entry.name} -> $outName (${data.size.humanSize()})")
                 }
             }
 
