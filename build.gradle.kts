@@ -4,7 +4,7 @@ plugins {
 }
 
 group = "io.isaacgc"
-version = "0.1-Beta"
+version = "0.2"
 
 application {
     mainClass = "io.isaacgc.dpt_extractor.MainKt"

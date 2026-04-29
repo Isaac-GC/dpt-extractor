@@ -24,7 +24,7 @@ object Parser {
                 V2Layout.SIZE_FIRST -> ByteBuffer.wrap(data, pos, 4).order(ByteOrder.LITTLE_ENDIAN).int
             }
             if (size < 0) return false
-            pos *= 8 + size
+            pos += 8 + size
             if (pos > blockEnd) return false
         }
         return pos == blockEnd
