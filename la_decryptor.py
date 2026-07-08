@@ -342,7 +342,7 @@ class DptExtractor:
 
         return records
 
-    def parse(self, data):
+    def parse(self, data, insns_xor_key=None):
         # dex code table is little-endian
         version = u16(data, 0)
         dex_count = u16(data, 2)
@@ -372,14 +372,26 @@ class DptExtractor:
             records = self.read_block(data, offsets[dex_idx], block_ends[dex_idx], dex_idx, version, v2_layout)
             blocks.append(DexCodeBlock(dex_idx, records))
 
-        xor_key = self.detect_xor_key(blocks)
-        if xor_key != 0:
-            self.logger.info('Detected XOR encrypted instructions (key=0x%02x) -> decrypting...' % xor_key)
+        # De-obfuscate insns. The shell config's insns_xor_key is authoritative (it can be
+        # a full 4-byte key, e.g. 0xA83A5F10); only fall back to the single-byte frequency
+        # heuristic when no config key was recovered.
+        if insns_xor_key is not None:
+            xk = struct.pack('<I', insns_xor_key & 0xFFFFFFFF)
+            self.logger.info('Applying config insns_xor_key=0x%08x (4-byte) -> decrypting...' % (insns_xor_key & 0xFFFFFFFF))
             for block in blocks:
                 for r in block.records.values():
                     d = r.insns_data
                     for i in range(len(d)):
-                        d[i] ^= xor_key  # in-place, needs bytearray
+                        d[i] ^= xk[i & 3]
+        else:
+            xor_key = self.detect_xor_key(blocks)
+            if xor_key != 0:
+                self.logger.info('Detected XOR encrypted instructions (key=0x%02x) -> decrypting...' % xor_key)
+                for block in blocks:
+                    for r in block.records.values():
+                        d = r.insns_data
+                        for i in range(len(d)):
+                            d[i] ^= xor_key  # in-place, needs bytearray
         return blocks
 
 
@@ -717,6 +729,33 @@ def read_shell_key(elf):
     return None
 
 
+def find_shell_key(records):
+    """Scan APK records for the shell .so; return (name, 16-byte DPT_*_DATA key) or (None, None)."""
+    for r in records:
+        if r['blob'][:4] == b'\x7fELF':
+            key = read_shell_key(r['blob'])
+            if key:
+                return r['name'], key
+    return None, None
+
+
+def decrypt_shell_config(records, key):
+    """Find + AES-128-CBC-decrypt the shell config JSON. Its asset name is randomized, so it's
+    identified by content (decrypts to '{...}'). Works for stock (d_shell_data_001) and forks."""
+    iv = generate_iv(key)
+    for r in records:
+        blob = r['blob']
+        if not r['name'].startswith('assets/') or len(blob) < 16 or len(blob) % 16 or len(blob) > 0x10000:
+            continue
+        try:
+            dec = aes128_cbc_decrypt(key, iv, blob)
+            if dec[:1] == b'{':
+                return r['name'], json.loads(dec)
+        except Exception:
+            continue
+    return None, None
+
+
 class ConfigVariantExtractor:
     def __init__(self, zip_parser: SimplifiedZipParser, logger: Log):
         self.zip = zip_parser
@@ -893,6 +932,18 @@ def main():
 
     extractor = DptExtractor(zip_parser, logger)
 
+    # 0. Recover the shell config's insns_xor_key (authoritative). dpt-shell XORs the
+    #    extracted insns with a per-build key that can be a full 4 bytes -- the single-byte
+    #    frequency heuristic misses those, silently yielding garbage bytecode.
+    cfg_xor = None
+    so_name, shell_key = find_shell_key(zip_parser.records)
+    if shell_key:
+        _, cfg = decrypt_shell_config(zip_parser.records, shell_key)
+        if cfg and isinstance(cfg.get('insns_xor_key'), int):
+            cfg_xor = cfg['insns_xor_key']
+            logger.ok(f"Shell key {shell_key.hex()} ({so_name}); "
+                      f"config insns_xor_key=0x{cfg_xor & 0xffffffff:08x}")
+
     # 1. Locate + parse the packed code table (the dpt-shell "OoooooOooo"
     #    equivalent). Its name can be randomized and the method is_dex_content
     #    is only a heuristic, so we try every candidate and keep the first that
@@ -902,7 +953,7 @@ def main():
         if not is_dex_content(r['blob']):
             continue
         try:
-            blocks = extractor.parse(r['blob'])
+            blocks = extractor.parse(r['blob'], insns_xor_key=cfg_xor)
             packed = r
             break
         except Exception as e:
