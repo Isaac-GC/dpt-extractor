@@ -9,8 +9,8 @@ import zipfile
 import zlib
 import re
 
-## Needs pycryptodome
-# pip install pycryptodome
+# Pure-stdlib: no third-party packages required. (openssl CLI is used only as an
+# optional speed-up for the large dex_store decrypt, if it happens to be installed.)
 
 # helper consts
 EOCD = b'PK\x05\x06' # End of Central Directory
@@ -619,40 +619,71 @@ def aes128_cbc_decrypt(key, iv, data, strip_pkcs7=True):
     return bytes(out)
 
 
-# --- AES-128 CTR (encrypt path; used for the dex_store container) -----------
-def _shift_rows(s):                      # forward: row r rotated LEFT by r
-    out = [0] * 16
-    for r in range(4):
-        for c in range(4):
-            out[r + 4 * c] = s[r + 4 * ((c + r) % 4)]
-    return out
+# --- AES-128 CTR (encrypt path; for the dex_store container) -----------------
+# Self-contained T-table AES-128 encrypt -- no third-party crypto. ~1.5 MB/s in pure
+# Python; the openssl CLI (a system tool, if present) is used as an optional accelerator.
+def _te_tables():
+    xt = lambda a: ((a << 1) ^ 0x1b) & 0xff if a & 0x80 else (a << 1) & 0xff
+    te0 = [0] * 256
+    for x in range(256):
+        s = _SBOX[x]; s2 = xt(s); s3 = s2 ^ s
+        te0[x] = ((s2 << 24) | (s << 16) | (s << 8) | s3) & 0xffffffff
+    te1 = [((v >> 8) | (v << 24)) & 0xffffffff for v in te0]
+    te2 = [((v >> 16) | (v << 16)) & 0xffffffff for v in te0]
+    te3 = [((v >> 24) | (v << 8)) & 0xffffffff for v in te0]
+    return te0, te1, te2, te3
 
-def _mix_columns(s):
-    out = [0] * 16
-    for c in range(4):
-        a = s[4 * c:4 * c + 4]
-        out[4 * c + 0] = _gmul(a[0], 2) ^ _gmul(a[1], 3) ^ a[2] ^ a[3]
-        out[4 * c + 1] = a[0] ^ _gmul(a[1], 2) ^ _gmul(a[2], 3) ^ a[3]
-        out[4 * c + 2] = a[0] ^ a[1] ^ _gmul(a[2], 2) ^ _gmul(a[3], 3)
-        out[4 * c + 3] = _gmul(a[0], 3) ^ a[1] ^ a[2] ^ _gmul(a[3], 2)
-    return out
+_TE0, _TE1, _TE2, _TE3 = _te_tables()
+
+def _aes128_enc_key_words(key):
+    rk = [int.from_bytes(key[4 * i:4 * i + 4], 'big') for i in range(4)]
+    for i in range(4, 44):
+        t = rk[i - 1]
+        if i % 4 == 0:
+            t = ((t << 8) | (t >> 24)) & 0xffffffff                             # RotWord
+            t = (_SBOX[(t >> 24) & 0xff] << 24) | (_SBOX[(t >> 16) & 0xff] << 16) \
+                | (_SBOX[(t >> 8) & 0xff] << 8) | _SBOX[t & 0xff]               # SubWord
+            t ^= _RCON[i // 4 - 1] << 24
+        rk.append(rk[i - 4] ^ t)
+    return rk
 
 def _aes128_encrypt_block(block, rk):
-    s = [block[i] ^ rk[0][i] for i in range(16)]
+    te0, te1, te2, te3 = _TE0, _TE1, _TE2, _TE3
+    s0 = int.from_bytes(block[0:4], 'big') ^ rk[0]
+    s1 = int.from_bytes(block[4:8], 'big') ^ rk[1]
+    s2 = int.from_bytes(block[8:12], 'big') ^ rk[2]
+    s3 = int.from_bytes(block[12:16], 'big') ^ rk[3]
     for r in range(1, 10):
-        s = _shift_rows([_SBOX[b] for b in s])
-        s = _mix_columns(s)
-        s = [s[i] ^ rk[r][i] for i in range(16)]
-    s = _shift_rows([_SBOX[b] for b in s])
-    return bytes(s[i] ^ rk[10][i] for i in range(16))
+        j = 4 * r
+        s0, s1, s2, s3 = (
+            te0[s0 >> 24] ^ te1[(s1 >> 16) & 0xff] ^ te2[(s2 >> 8) & 0xff] ^ te3[s3 & 0xff] ^ rk[j],
+            te0[s1 >> 24] ^ te1[(s2 >> 16) & 0xff] ^ te2[(s3 >> 8) & 0xff] ^ te3[s0 & 0xff] ^ rk[j + 1],
+            te0[s2 >> 24] ^ te1[(s3 >> 16) & 0xff] ^ te2[(s0 >> 8) & 0xff] ^ te3[s1 & 0xff] ^ rk[j + 2],
+            te0[s3 >> 24] ^ te1[(s0 >> 16) & 0xff] ^ te2[(s1 >> 8) & 0xff] ^ te3[s2 & 0xff] ^ rk[j + 3])
+    o0 = ((_SBOX[s0 >> 24] << 24) | (_SBOX[(s1 >> 16) & 0xff] << 16) | (_SBOX[(s2 >> 8) & 0xff] << 8) | _SBOX[s3 & 0xff]) ^ rk[40]
+    o1 = ((_SBOX[s1 >> 24] << 24) | (_SBOX[(s2 >> 16) & 0xff] << 16) | (_SBOX[(s3 >> 8) & 0xff] << 8) | _SBOX[s0 & 0xff]) ^ rk[41]
+    o2 = ((_SBOX[s2 >> 24] << 24) | (_SBOX[(s3 >> 16) & 0xff] << 16) | (_SBOX[(s0 >> 8) & 0xff] << 8) | _SBOX[s1 & 0xff]) ^ rk[42]
+    o3 = ((_SBOX[s3 >> 24] << 24) | (_SBOX[(s0 >> 16) & 0xff] << 16) | (_SBOX[(s1 >> 8) & 0xff] << 8) | _SBOX[s2 & 0xff]) ^ rk[43]
+    return (o0 << 96 | o1 << 64 | o2 << 32 | o3).to_bytes(16, 'big')
+
+def _aes128_ctr_py(key, iv12, data, counter):
+    """Pure-stdlib AES-128-CTR (T-table core). Counter block = iv12 || BE32(ctr)."""
+    rk = _aes128_enc_key_words(key)
+    out = bytearray(); ctr = counter
+    for off in range(0, len(data), 16):
+        ks = _aes128_encrypt_block(iv12 + ctr.to_bytes(4, 'big'), rk)
+        chunk = data[off:off + 16]
+        if len(chunk) == 16:
+            out += (int.from_bytes(chunk, 'big') ^ int.from_bytes(ks, 'big')).to_bytes(16, 'big')
+        else:
+            out += bytes(chunk[i] ^ ks[i] for i in range(len(chunk)))
+        ctr = (ctr + 1) & 0xffffffff
+    return bytes(out)
 
 def aes128_ctr(key, iv12, data, counter=2):
-    try:                                                      # 1. pycryptodome
-        from Crypto.Cipher import AES as _CAES
-        return _CAES.new(key, _CAES.MODE_CTR, nonce=iv12, initial_value=counter).decrypt(data)
-    except Exception:
-        pass
-    try:                                                      # 2. openssl CLI
+    """AES-128-CTR over `data` (counter block = iv12 || BE32(ctr)). Self-contained; uses the
+    openssl CLI as an optional accelerator when present (no third-party Python deps either way)."""
+    try:                                                      # optional speed-up: system openssl
         import shutil, subprocess
         if shutil.which('openssl'):
             iv = (iv12 + counter.to_bytes(4, 'big')).hex()
@@ -662,7 +693,7 @@ def aes128_ctr(key, iv12, data, counter=2):
                 return p.stdout
     except Exception:
         pass
-    return _aes128_ctr_py(key, iv12, data, counter)           # 3. pure-Python fallback
+    return _aes128_ctr_py(key, iv12, data, counter)           # self-contained fallback
 
 
 def decrypt_dex_store(stub_dex, key):
