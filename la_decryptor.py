@@ -1,5 +1,6 @@
 import argparse
 import hashlib
+import hmac
 import io
 import json
 import os
@@ -568,16 +569,24 @@ def _gmul(a, b):
         b >>= 1
     return p
 
-def _aes128_round_keys(key):
-    w = [list(key[4 * i:4 * i + 4]) for i in range(4)]
-    for i in range(4, 44):
+def _aes_round_keys(key):
+    """AES-128 or AES-256 round keys (Nk=4->11 keys/10 rounds, Nk=8->15 keys/14 rounds)."""
+    nk = len(key) // 4                                  # 4 (AES-128) or 8 (AES-256)
+    nr = nk + 6                                          # 10 or 14 rounds
+    w = [list(key[4 * i:4 * i + 4]) for i in range(nk)]
+    for i in range(nk, 4 * (nr + 1)):
         t = list(w[i - 1])
-        if i % 4 == 0:
+        if i % nk == 0:
             t = [_SBOX[b] for b in (t[1:] + t[:1])]     # RotWord + SubWord
-            t[0] ^= _RCON[i // 4 - 1]
-        w.append([w[i - 4][j] ^ t[j] for j in range(4)])
+            t[0] ^= _RCON[i // nk - 1]
+        elif nk == 8 and i % nk == 4:
+            t = [_SBOX[b] for b in t]                   # AES-256 extra SubWord
+        w.append([w[i - nk][j] ^ t[j] for j in range(4)])
     # state is column-major: byte index = row + 4*col
-    return [bytes(w[4 * r + c][row] for c in range(4) for row in range(4)) for r in range(11)]
+    return [bytes(w[4 * r + c][row] for c in range(4) for row in range(4)) for r in range(nr + 1)]
+
+def _aes128_round_keys(key):                             # kept for callers using the old name
+    return _aes_round_keys(key)
 
 def _inv_shift_rows(s):
     out = [0] * 16
@@ -596,14 +605,15 @@ def _inv_mix_columns(s):
         out[4 * c + 3] = _gmul(a[0], 11) ^ _gmul(a[1], 13) ^ _gmul(a[2], 9) ^ _gmul(a[3], 14)
     return out
 
-def aes128_cbc_decrypt(key, iv, data, strip_pkcs7=True):
-    """Decrypt AES-128-CBC. Ignores a trailing partial block."""
-    rk = _aes128_round_keys(key)
+def aes_cbc_decrypt(key, iv, data, strip_pkcs7=True):
+    """Decrypt AES-CBC (128- or 256-bit key). Ignores a trailing partial block."""
+    rk = _aes_round_keys(key)
+    nr = len(rk) - 1
     out = bytearray(); prev = list(iv)
     for off in range(0, len(data) - (len(data) % 16), 16):
         c = list(data[off:off + 16])
-        st = [c[i] ^ rk[10][i] for i in range(16)]
-        for r in range(9, 0, -1):
+        st = [c[i] ^ rk[nr][i] for i in range(16)]
+        for r in range(nr - 1, 0, -1):
             st = _inv_shift_rows(st)
             st = [_INV_SBOX[b] for b in st]
             st = [st[i] ^ rk[r][i] for i in range(16)]
@@ -617,6 +627,9 @@ def aes128_cbc_decrypt(key, iv, data, strip_pkcs7=True):
         if 1 <= pad <= 16 and all(b == pad for b in out[-pad:]):
             out = out[:-pad]
     return bytes(out)
+
+def aes128_cbc_decrypt(key, iv, data, strip_pkcs7=True):  # back-compat alias
+    return aes_cbc_decrypt(key, iv, data, strip_pkcs7)
 
 
 # --- AES-128 CTR (encrypt path; for the dex_store container) -----------------
@@ -761,66 +774,186 @@ def read_shell_key(elf):
 
 
 def find_shell_key(records):
-    """Scan APK records for the shell .so; return (name, 16-byte DPT_*_DATA key) or (None, None)."""
+    """Scan APK records for the shell .so; return (name, blob, 16-byte DPT_*_DATA key) or (None,None,None)."""
     for r in records:
         if r['blob'][:4] == b'\x7fELF':
             key = read_shell_key(r['blob'])
             if key:
-                return r['name'], key
-    return None, None
+                return r['name'], r['blob'], key
+    return None, None, None
 
 
-def decrypt_shell_config(records, key):
-    """Find + AES-128-CBC-decrypt the shell config JSON. Its asset name is randomized, so it's
-    identified by content (decrypts to '{...}'). Works for stock (d_shell_data_001) and forks."""
-    iv = generate_iv(key)
-    for r in records:
-        blob = r['blob']
-        if not r['name'].startswith('assets/') or len(blob) < 16 or len(blob) % 16 or len(blob) > 0x10000:
-            continue
+def _elf_data_sections(elf):
+    """Concatenate the data-bearing sections (.rodata/.data.rel.ro/.data) of an ELF64."""
+    if elf[:4] != b'\x7fELF' or elf[4] != 2:
+        return b''
+    u16 = lambda o: int.from_bytes(elf[o:o + 2], 'little')
+    u32 = lambda o: int.from_bytes(elf[o:o + 4], 'little')
+    u64 = lambda o: int.from_bytes(elf[o:o + 8], 'little')
+    shoff, shent, shnum, shstr = u64(0x28), u16(0x3a), u16(0x3c), u16(0x3e)
+    strtab = u64(shoff + shstr * shent + 0x18)
+    out = bytearray()
+    for i in range(shnum):
+        b = shoff + i * shent
+        typ, off, sz = u32(b + 4), u64(b + 0x18), u64(b + 0x20)
+        n = u32(b)
+        e = elf.index(b'\0', strtab + n)
+        name = elf[strtab + n:e].decode('latin1', 'replace')
+        if typ == 1 and name in ('.rodata', '.data.rel.ro', '.data'):   # PROGBITS
+            out += elf[off:off + sz]
+    return bytes(out)
+
+
+def recover_build_key_candidates(elf, nchars=16, klen=8):
+    """Candidate dpt-shell build-keys read straight from the .so.
+
+    The build-key is AY_OBFUSCATE'd: `nchars` lowercase-hex chars + NUL, XOR'd with an
+    8-byte cycling key that is ALSO stored (as plaintext) in the read-only data. The
+    encrypted NUL pins K[0] (= D[nchars]); we then pair each obfuscated window with a
+    stored 8-byte key starting with that byte and keep pairs that decode to all-hex.
+    The result is a small set to validate against the config (see decrypt_shell_config).
+    """
+    HEX = frozenset(b'0123456789abcdef')
+    region = _elf_data_sections(elf)
+    if len(region) < nchars + 1:
+        return set()
+    from collections import defaultdict
+    idx = defaultdict(set)
+    for o in range(len(region) - klen):
+        idx[region[o]].add(bytes(region[o:o + klen]))
+    out = set()
+    for off in range(len(region) - (nchars + 1)):
+        k0 = region[off + nchars]                       # encrypted NUL -> K[0]
+        if (region[off] ^ k0) not in HEX or (region[off + klen] ^ k0) not in HEX:
+            continue                                    # null anchor (cheap prune)
+        D = region[off:off + nchars]
+        for K in idx.get(k0, ()):
+            dec = bytes(D[i] ^ K[i % klen] for i in range(nchars))
+            if all(c in HEX for c in dec):
+                out.add(dec.decode('ascii'))
+    return out
+
+
+def _axml_strings(d):
+    """Extract the string pool from a binary AndroidManifest.xml (UTF-8 or UTF-16)."""
+    if len(d) < 36 or int.from_bytes(d[8:10], 'little') != 0x0001:   # STRING_POOL chunk
+        return []
+    count = int.from_bytes(d[16:20], 'little')
+    flags = int.from_bytes(d[24:28], 'little')
+    strings_start = int.from_bytes(d[28:32], 'little')
+    utf8 = bool(flags & 0x100)
+    base = 8 + strings_start
+    out = []
+    for i in range(count):
         try:
-            dec = aes128_cbc_decrypt(key, iv, blob)
+            so = base + int.from_bytes(d[36 + 4 * i:40 + 4 * i], 'little')
+            if utf8:
+                p = so + (2 if d[so] & 0x80 else 1)                 # skip char count
+                bl = d[p]
+                p += 2 if bl & 0x80 else 1
+                if bl & 0x80:
+                    bl = ((bl & 0x7f) << 8) | d[p - 1]
+                out.append(d[p:p + bl].decode('utf-8', 'replace'))
+            else:
+                n = int.from_bytes(d[so:so + 2], 'little')
+                so2 = so + (4 if n & 0x8000 else 2)
+                if n & 0x8000:
+                    n = ((n & 0x7fff) << 16) | int.from_bytes(d[so + 2:so + 4], 'little')
+                out.append(d[so2:so2 + n * 2].decode('utf-16-le', 'replace'))
+        except Exception:
+            pass
+    return out
+
+
+def _manifest_packages(records):
+    """Candidate package names from AndroidManifest.xml (the current config crypto HMACs
+    over `package + '_' + build_key`, so we need the exact package string)."""
+    mf = next((r['blob'] for r in records if r['name'] == 'AndroidManifest.xml'), None)
+    if not mf:
+        return []
+    seen = []
+    for s in _axml_strings(mf):
+        if re.fullmatch(r'[a-z][a-z0-9_]*(\.[a-z0-9_]+)+', s or '') and s not in seen:
+            seen.append(s)
+    return seen
+
+
+def decrypt_shell_config(records, key, build_key=None, elf=None, logger=None):
+    """Find + decrypt the shell config JSON (asset name is randomized -> identified by content).
+
+    Tries the LEGACY scheme first: AES-128-CBC(rc4Key, generateIV(rc4Key), ct).
+    Then the CURRENT upstream scheme (dpt-shell >= 2026-07): AES-256-CBC with
+    aesKey = HMAC-SHA256(rc4Key, package + '_' + build_key), iv = generateIV(rc4Key).
+    The per-build `build_key` is taken from --build-key if given, else auto-recovered from
+    the shell `.so` (`elf`) and validated here by which candidate actually decrypts the config.
+    """
+    iv = generate_iv(key)
+    cands = [r for r in records
+             if r['name'].startswith('assets/') and r['blob']
+             and len(r['blob']) % 16 == 0 and 16 <= len(r['blob']) <= 0x10000]
+    # legacy: AES-128, raw key
+    for r in cands:
+        try:
+            dec = aes_cbc_decrypt(key, iv, r['blob'])
             if dec[:1] == b'{':
                 return r['name'], json.loads(dec)
         except Exception:
-            continue
+            pass
+    # current: AES-256, key = HMAC-SHA256(rc4Key, package + '_' + build_key)
+    if build_key:
+        build_keys = [build_key if isinstance(build_key, str) else build_key.decode('latin1')]
+    elif elf is not None:
+        build_keys = sorted(recover_build_key_candidates(elf))     # validated below by config decrypt
+    else:
+        build_keys = []
+    if build_keys:
+        packages = _manifest_packages(records)
+        for bk in build_keys:
+            for pkg in packages:
+                aes_key = hmac.new(key, (pkg + '_' + bk).encode('utf-8'), hashlib.sha256).digest()
+                for r in cands:
+                    try:
+                        if aes_cbc_decrypt(aes_key, iv, r['blob'][:16], strip_pkcs7=False)[:1] != b'{':
+                            continue                                # cheap 1-block prune
+                        dec = aes_cbc_decrypt(aes_key, iv, r['blob'])
+                        if dec[:1] == b'{':
+                            cfg = json.loads(dec)
+                            if not build_key and logger:
+                                logger.ok(f"Auto-recovered build-key from .so: {bk} (package {pkg})")
+                            return r['name'], cfg
+                    except Exception:
+                        pass
     return None, None
 
 
 class ConfigVariantExtractor:
-    def __init__(self, zip_parser: SimplifiedZipParser, logger: Log):
+    def __init__(self, zip_parser: SimplifiedZipParser, logger: Log, build_key=None):
         self.zip = zip_parser
         self.logger = logger
+        self.build_key = build_key
 
     def _asset(self, name):
         return next((r['blob'] for r in self.zip.records if r['name'] == name), None)
 
     def find_key(self):
+        self.shell_elf = None
         for r in self.zip.records:
             blob = r['blob']
             if blob[:4] != b'\x7fELF':
                 continue
             key = read_shell_key(blob)
             if key:
+                self.shell_elf = blob
                 self.logger.ok(f"Recovered shell key from {r['name']}: {key.hex()}")
                 return key
         return None
 
     def decrypt_config(self, key):
-        iv = generate_iv(key)
-        for r in self.zip.records:
-            blob = r['blob']
-            if not r['name'].startswith('assets/') or len(blob) < 16 or len(blob) % 16 or len(blob) > 0x10000:
-                continue
-            try:
-                dec = aes128_cbc_decrypt(key, iv, blob)
-                if dec[:1] == b'{':
-                    cfg = json.loads(dec)
-                    self.logger.ok(f"Decrypted shell config: {r['name']}")
-                    return cfg
-            except Exception:
-                continue
-        return None
+        name, cfg = decrypt_shell_config(self.zip.records, key, build_key=self.build_key,
+                                         elf=getattr(self, 'shell_elf', None), logger=self.logger)
+        if cfg is not None:
+            self.logger.ok(f"Decrypted shell config: {name}")
+        return cfg
 
     def parse_v3_table(self, data, xor_key):
         helper = DptExtractor(self.zip, self.logger)     # reuse can_walk / read_block
@@ -951,6 +1084,9 @@ def main():
     parser.add_argument('file', help='file to decrypt (apk)')
     parser.add_argument('-v', '--verbose', action='store_true', help='verbose output')
     parser.add_argument('-o', '--output', default='out', help='output directory (default: out)')
+    parser.add_argument('--build-key', default=None,
+                        help='per-build key for dpt-shell >= 2026-07 (AES-256 + HMAC config); '
+                             'reversed from the shell .so. Needed only for recent builds.')
 
     args = parser.parse_args()
     logger = Log(verbose=args.verbose)
@@ -967,13 +1103,20 @@ def main():
     #    extracted insns with a per-build key that can be a full 4 bytes -- the single-byte
     #    frequency heuristic misses those, silently yielding garbage bytecode.
     cfg_xor = None
-    so_name, shell_key = find_shell_key(zip_parser.records)
+    so_name, so_blob, shell_key = find_shell_key(zip_parser.records)
     if shell_key:
-        _, cfg = decrypt_shell_config(zip_parser.records, shell_key)
+        _, cfg = decrypt_shell_config(zip_parser.records, shell_key,
+                                      build_key=args.build_key, elf=so_blob, logger=logger)
         if cfg and isinstance(cfg.get('insns_xor_key'), int):
             cfg_xor = cfg['insns_xor_key']
             logger.ok(f"Shell key {shell_key.hex()} ({so_name}); "
                       f"config insns_xor_key=0x{cfg_xor & 0xffffffff:08x}")
+        elif cfg is None:
+            logger.warn(f"Shell key found ({so_name}) but no config decrypted.")
+            logger.warn("If this is a recent dpt-shell build (>=2026-07), the config is now")
+            logger.warn("AES-256 + HMAC-SHA256(key, package+'_'+build-key). The build-key could not")
+            logger.warn("be auto-recovered from the .so; pass it explicitly with --build-key.")
+            logger.warn("Without it insns_xor_key is unknown -> multi-byte-XOR'd bytecode would be WRONG.")
 
     # 1. Locate + parse the packed code table (the dpt-shell "OoooooOooo"
     #    equivalent). Its name can be randomized and the method is_dex_content
@@ -992,7 +1135,7 @@ def main():
 
     if blocks is None:
         logger.warn("No plaintext dpt-shell table found -- trying hardened-fork fallback (config-based)")
-        if ConfigVariantExtractor(zip_parser, logger).run(args.output):
+        if ConfigVariantExtractor(zip_parser, logger, build_key=args.build_key).run(args.output):
             return
         logger.err("Fallback failed too. See docs/dpt-shell-runtime-variant.md")
         sys.exit(1)
