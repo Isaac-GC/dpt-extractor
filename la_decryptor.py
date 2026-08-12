@@ -54,6 +54,28 @@ def human_size(val):
     else: return f"{val:.1f} B"
 
 
+def _looks_encrypted(b):
+    """True if `b` looks like ciphertext (mostly non-printable). Size-robust, unlike entropy
+    (a 224-byte AES blob can't reach high Shannon entropy). Text is ~95%+ printable; AES ~37%."""
+    if not b:
+        return False
+    printable = sum(1 for x in b if 0x20 <= x <= 0x7e or x in (9, 10, 13))
+    return printable / len(b) < 0.75
+
+
+def has_encrypted_config(records):
+    """True if the APK ships a config-SHAPED asset (small, 16-aligned, ciphertext-looking, not
+    the code table). Distinguishes a new-scheme/undecryptable config from an old build that has
+    no encrypted config at all (plaintext app_name/app_acf)."""
+    for r in records:
+        b = r['blob']
+        if (r['name'].startswith('assets/') and b and len(b) % 16 == 0
+                and 16 <= len(b) <= 0x10000 and not is_dex_content(b)
+                and _looks_encrypted(b)):
+            return True
+    return False
+
+
 # --- reusable logic adapted from unknown_dump.py (min_vm-independent) --------
 
 def resolve_base_apk(data):
@@ -310,12 +332,13 @@ class DptExtractor:
 
         for it in range(method_count):
             if version == 1:
+                # v1 record: methodIdx(u32), offsetDexIdx(u32), insnsSize(u32), then insns INLINE
                 if pos + 12 > block_end:
                     error_out_misaligned(dex_idx, it, method_count, pos, 'Header runs past block end')
                 method_idx     = i32(data, pos)
                 offset_dex_idx = i32(data, pos + 4)
                 insns_bytes    = i32(data, pos + 8)
-                insns_start    = i32(data, pos + 12)
+                insns_start    = pos + 12
             else:                                       # V2
                 if pos + 8 > block_end:
                     error_out_misaligned(dex_idx, it, method_count, pos, 'Header runs past block end')
@@ -1111,11 +1134,13 @@ def main():
             cfg_xor = cfg['insns_xor_key']
             logger.ok(f"Shell key {shell_key.hex()} ({so_name}); "
                       f"config insns_xor_key=0x{cfg_xor & 0xffffffff:08x}")
-        elif cfg is None:
-            logger.warn(f"Shell key found ({so_name}) but no config decrypted.")
-            logger.warn("If this is a recent dpt-shell build (>=2026-07), the config is now")
-            logger.warn("AES-256 + HMAC-SHA256(key, package+'_'+build-key). The build-key could not")
-            logger.warn("be auto-recovered from the .so; pass it explicitly with --build-key.")
+        elif cfg is None and has_encrypted_config(zip_parser.records):
+            # Only warn when an encrypted, config-shaped asset is actually present but
+            # couldn't be read (new-scheme / fork). Old builds ship no such asset -> stay quiet.
+            logger.warn(f"Shell key found ({so_name}) and an encrypted config is present, but it")
+            logger.warn("could not be decrypted. If this is a recent dpt-shell build (>=2026-07),")
+            logger.warn("the config is AES-256 + HMAC-SHA256(key, package+'_'+build-key) and the")
+            logger.warn("build-key could not be auto-recovered from the .so -- pass it via --build-key.")
             logger.warn("Without it insns_xor_key is unknown -> multi-byte-XOR'd bytecode would be WRONG.")
 
     # 1. Locate + parse the packed code table (the dpt-shell "OoooooOooo"

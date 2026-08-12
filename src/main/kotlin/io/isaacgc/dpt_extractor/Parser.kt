@@ -83,7 +83,9 @@ object Parser {
                 methodIdx = i32(data, pos)
                 offsetDexIdx = i32(data, pos + 4)
                 insnsBytes = i32(data, pos + 8)
-                isnsnStart = i32(data, pos + 12)
+                // v1 header is 12 bytes, the insns are stored inline right after it
+                //      (not at some absolute offset, that was wrong and broke older packed apks)
+                isnsnStart = pos + 12
 
             } else { // V2 crap
                 if (pos + 8 > blockEnd) errorOutMisaligned(dexIdx, it, methodCount, pos, "Header runs past block end")
